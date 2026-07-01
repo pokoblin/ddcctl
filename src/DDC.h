@@ -16,6 +16,36 @@
 #include <CoreGraphics/CGDisplayConfiguration.h>
 #include <ColorSync/ColorSyncDevice.h>
 
+/*
+ * On Apple Silicon the legacy IOFramebuffer I2C interface (IOFBCopyI2CInterfaceForBus
+ * et al.) is not exposed by the GPU drivers, so DDC/CI must instead go through the
+ * private IOAVService API published by DCPAVServiceProxy (the same path m1ddc and
+ * MonitorControl use). On Intel Macs we keep talking to the IOFramebuffer directly.
+ *
+ * DDCDisplay abstracts "the handle we send DDC commands to" for both worlds:
+ *   - Apple Silicon: an IOAVServiceRef
+ *   - Intel:         an io_service_t IOFramebuffer
+ */
+#if __arm64__
+// IOAVServiceRef is a private CoreDisplay type
+typedef CFTypeRef IOAVServiceRef;
+typedef IOAVServiceRef DDCDisplay;
+
+// Private CoreDisplay / IOKit symbols (resolved via -framework CoreDisplay)
+extern IOAVServiceRef IOAVServiceCreate(CFAllocatorRef allocator);
+extern IOAVServiceRef IOAVServiceCreateWithService(CFAllocatorRef allocator, io_service_t service);
+extern IOReturn IOAVServiceReadI2C(IOAVServiceRef service, uint32_t chipAddress, uint32_t offset, void *outputBuffer, uint32_t outputBufferSize);
+extern IOReturn IOAVServiceWriteI2C(IOAVServiceRef service, uint32_t chipAddress, uint32_t dataAddress, void *inputBuffer, uint32_t inputBufferSize);
+extern CFDictionaryRef CoreDisplay_DisplayCreateInfoDictionary(CGDirectDisplayID display);
+
+// Resolve the IOAVService that drives a given CGDisplay (NULL if none / built-in).
+IOAVServiceRef AVServiceFromCGDisplayID(CGDirectDisplayID displayID);
+// Copy the display's product name from its IORegistry DisplayAttributes (caller releases). NULL if unavailable.
+CFStringRef ProductNameFromCGDisplayID(CGDirectDisplayID displayID);
+#else
+typedef io_service_t DDCDisplay;
+#endif
+
 #define RESET 0x04
 #define RESET_BRIGHTNESS_AND_CONTRAST 0x05
 #define RESET_GEOMETRY 0x06
@@ -239,8 +269,8 @@ struct EDID {
 
 extern long DDCDelayBase; // nanoseconds
 long DDCDelay(io_service_t framebuffer);
-bool DDCWrite(io_service_t framebuffer, struct DDCWriteCommand *write);
-bool DDCRead(io_service_t framebuffer, struct DDCReadCommand *read);
+bool DDCWrite(DDCDisplay display, struct DDCWriteCommand *write);
+bool DDCRead(DDCDisplay display, struct DDCReadCommand *read);
 bool EDIDTest(io_service_t framebuffer, struct EDID *edid);
 UInt32 SupportedTransactionType(void);
 io_service_t IOFramebufferPortFromCGDisplayID(CGDirectDisplayID displayID, CFStringRef displayLocation);

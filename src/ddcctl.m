@@ -76,7 +76,7 @@ NSString *getDisplayDeviceLocation(CGDirectDisplayID cdisplay)
 }
 
 /* Get current value for control from display */
-uint getControl(CGDirectDisplayID cdisplay, uint control_id)
+uint getControl(DDCDisplay display, uint control_id)
 {
     struct DDCReadCommand command;
     command.control_id = control_id;
@@ -84,7 +84,7 @@ uint getControl(CGDirectDisplayID cdisplay, uint control_id)
     command.current_value = 0;
     MyLog(@"D: querying VCP control: #%u =?", command.control_id);
 
-    if (!DDCRead(cdisplay, &command)) {
+    if (!DDCRead(display, &command)) {
         MyLog(@"E: DDC send command failed!");
         MyLog(@"E: VCP control #%u (0x%02hhx) = current: %u, max: %u", command.control_id, command.control_id, command.current_value, command.max_value);
     } else {
@@ -94,7 +94,7 @@ uint getControl(CGDirectDisplayID cdisplay, uint control_id)
 }
 
 /* Set new value for control from display */
-void setControl(io_service_t framebuffer, uint control_id, uint new_value)
+void setControl(DDCDisplay framebuffer, uint control_id, uint new_value)
 {
     struct DDCWriteCommand command;
     command.control_id = control_id;
@@ -130,7 +130,7 @@ void setControl(io_service_t framebuffer, uint control_id, uint new_value)
 }
 
 /* Get current value to Set relative value for control from display */
-void getSetControl(io_service_t framebuffer, uint control_id, NSString *new_value, NSString *operator)
+void getSetControl(DDCDisplay framebuffer, uint control_id, NSString *new_value, NSString *operator)
 {
     struct DDCReadCommand command;
     command.control_id = control_id;
@@ -405,24 +405,44 @@ int main(int argc, const char * argv[])
 
         CGDirectDisplayID cdisplay = ((NSNumber *)_displayIDs[displayId - 1]).unsignedIntegerValue;
 
+        // Acquire the handle we'll send DDC/I2C commands to. This differs by architecture:
+        // Apple Silicon uses an IOAVService, Intel uses the display's IOFramebuffer.
+#if __arm64__
+        DDCDisplay display = AVServiceFromCGDisplayID(cdisplay);
+        if (!display) {
+            MyLog(@"E: Failed to find an IOAVService for display #%lu (ID %u).", displayId, cdisplay);
+            MyLog(@"E: DDC/CI over Apple Silicon needs a display attached via USB-C/DisplayPort Alt Mode or Thunderbolt;");
+            MyLog(@"E: the built-in HDMI port on M1/entry-M2 Macs is not supported.");
+            return -1;
+        }
+
+        CFStringRef productName = ProductNameFromCGDisplayID(cdisplay);
+        if (productName) {
+            // non-ARC: take ownership of the +1 CFString by autoreleasing it as an NSString
+            screenName = [(__bridge NSString *)productName autorelease];
+            MyLog(@"I: found display #%lu (ID %u): %@", displayId, cdisplay, screenName);
+        } else {
+            MyLog(@"I: found display #%lu (ID %u)", displayId, cdisplay);
+        }
+#else
         // find & grab the IOFramebuffer for the display, the IOFB is where DDC/I2C commands are sent
-        io_service_t framebuffer = 0;
+        io_service_t display = 0;
         NSString *devLoc = getDisplayDeviceLocation(cdisplay);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         if (CGDisplayIOServicePort != NULL) {
             // legacy API call to get the IOFB's service port, was deprecated after macOS 10.9:
             //     https://developer.apple.com/library/mac/documentation/GraphicsImaging/Reference/Quartz_Services_Ref/index.html#//apple_ref/c/func/CGDisplayIOServicePort
-            framebuffer = CGDisplayIOServicePort(cdisplay);
+            display = CGDisplayIOServicePort(cdisplay);
 #pragma clang diagnostic pop
         }
 
-        if (! framebuffer && devLoc) {
+        if (! display && devLoc) {
             // a devLoc is required because, without that IOReg path, this func is prone to always match the 1st device of a monitor-pair (#17)
-            framebuffer = IOFramebufferPortFromCGDisplayID(cdisplay, (__bridge CFStringRef)devLoc);
+            display = IOFramebufferPortFromCGDisplayID(cdisplay, (__bridge CFStringRef)devLoc);
         }
 
-        if (! framebuffer) {
+        if (! display) {
             MyLog(@"E: Failed to acquire framebuffer device for display");
             return -1;
         }
@@ -430,7 +450,7 @@ int main(int argc, const char * argv[])
         MyLog(@"I: polling EDID for #%lu (ID %u => %@)", displayId, cdisplay, devLoc);
 
         struct EDID edid = {};
-        if (EDIDTest(framebuffer, &edid)) {
+        if (EDIDTest(display, &edid)) {
             for (union descriptor *des = edid.descriptors; des < edid.descriptors + sizeof(edid.descriptors) / sizeof(edid.descriptors[0]); des++) {
                 switch (des->text.type)
                 {
@@ -445,14 +465,15 @@ int main(int argc, const char * argv[])
             }
         } else {
             MyLog(@"E: Failed to poll display!");
-            IOObjectRelease(framebuffer);
+            IOObjectRelease(display);
             return -1;
         }
+#endif
 
         // Debugging
         if (dump_values) {
             for (uint i=0x00; i<=255; i++) {
-                getControl(framebuffer, i);
+                getControl(display, i);
                 usleep(command_interval);
             }
         }
@@ -467,22 +488,26 @@ int main(int argc, const char * argv[])
                 // this is a valid monitor control
                 NSString *argval_num = [argval stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"-+"]]; // look for relative setting ops
                 if ([argval hasPrefix:@"+"] || [argval hasPrefix:@"-"]) { // +/-NN relative
-                    getSetControl(framebuffer, control_id, argval_num, [argval substringToIndex:1]);
+                    getSetControl(display, control_id, argval_num, [argval substringToIndex:1]);
                 } else if ([argval hasSuffix:@"+"] || [argval hasSuffix:@"-"]) { // NN+/- relative
                     // read, calculate, then write
-                    getSetControl(framebuffer, control_id, argval_num, [argval substringFromIndex:argval.length - 1]);
+                    getSetControl(display, control_id, argval_num, [argval substringFromIndex:argval.length - 1]);
                 } else if ([argval hasPrefix:@"?"]) {
                     // read current setting
-                    getControl(framebuffer, control_id);
+                    getControl(display, control_id);
                 } else if (argval_num == argval) {
                     // write fixed setting
-                    setControl(framebuffer, control_id, [argval intValue]);
+                    setControl(display, control_id, [argval intValue]);
                 }
             }
             usleep(command_interval); // stagger comms to these wimpy I2C mcu's
         }];
-        // done with all actions, release display's framebuffer
-        IOObjectRelease(framebuffer);
+        // done with all actions, release the display handle
+#if __arm64__
+        CFRelease(display);
+#else
+        IOObjectRelease(display);
+#endif
     } // -autoreleasepool
     return 0;
 } // -main

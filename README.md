@@ -1,4 +1,6 @@
 # ddcctl: DDC monitor controls for the OSX command line #
+*Read this in another language: [简体中文](README_ZH_CN.md)*
+
 Adjust your external monitors' built-in controls from the OSX shell:
 
 * brightness
@@ -11,6 +13,19 @@ And *possibly* (if your monitor firmware is well implemented):
 * rgb colors
 * color presets
 * reset
+
+# Apple Silicon (M1/M2/M3/M4) #
+On Apple Silicon Macs the legacy IOFramebuffer I2C interface that ddcctl historically
+used is no longer exposed by the GPU drivers, so older builds could not talk DDC/CI at
+all. ddcctl now detects the architecture at build time and, on `arm64`, drives displays
+through the private `IOAVService` API (via `DCPAVServiceProxy`) — the same mechanism used
+by [m1ddc](https://github.com/waydabber/m1ddc) and MonitorControl. Intel Macs keep using
+the original IOFramebuffer path.
+
+Caveats on Apple Silicon:
+* The display must be attached over USB-C/DisplayPort Alt Mode or Thunderbolt. The
+  **built-in HDMI port** on M1 / entry-level M2 Macs does not carry DDC and is unsupported.
+* Reading VCP values (`-X ?`) works on displays whose firmware answers DDC/CI reads.
 
 # Project Status #
 This is a GPLv3 open source repo and you may use it in the ways that license allows.  
@@ -72,6 +87,8 @@ For example, to set your first display to HDMI: `ddcctl -d 1 -i 17`.
 `ddcctl.m` sprang from a [forum thread](https://www.tonymacx86.com/threads/controlling-your-monitor-with-osx-ddc-panel.90077/page-6#post-795208) on the TonyMac-x86 boards.
 
 `DDC.c` originated from [jontaylor/DDC-CI-Tools-for-OS-X](https://github.com/jontaylor/DDC-CI-Tools-for-OS-X), but was reworked by others on the forums.  
+
+The Apple Silicon (`arm64`) `IOAVService` code path was adapted from [waydabber/m1ddc](https://github.com/waydabber/m1ddc) (MIT licensed).  
 
 A few forks have also backported patches, which is *nice* :ok_hand:.
 

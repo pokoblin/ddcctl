@@ -31,7 +31,7 @@ $(BUILD_DIR)/%.o: $(SOURCE_DIR)/%.c
 
 $(PRODUCT_DIR)/ddcctl: $(BUILD_DIR)/DDC.o
 	@mkdir -p $(@D)
-	$(CC) -Wall $(CCFLAGS) -o $@ -lobjc -framework IOKit -framework AppKit -framework Foundation $< $(SOURCE_DIR)/$(@F).m
+	$(CC) -Wall $(CCFLAGS) -o $@ -lobjc -framework IOKit -framework AppKit -framework Foundation -framework CoreDisplay $< $(SOURCE_DIR)/$(@F).m
 
 install: $(PRODUCT_DIR)/ddcctl
 	install $(PRODUCT_DIR)/ddcctl $(INSTALL_DIR)

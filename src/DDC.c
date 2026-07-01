@@ -32,7 +32,7 @@ io_service_t IOFramebufferPortFromCGDisplayID(CGDirectDisplayID displayID, CFStr
     io_iterator_t iter;
     io_service_t serv, servicePort = 0;
 
-    kern_return_t err = IOServiceGetMatchingServices(kIOMasterPortDefault, IOServiceMatching(IOFRAMEBUFFER_CONFORMSTO), &iter);
+    kern_return_t err = IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(IOFRAMEBUFFER_CONFORMSTO), &iter);
 
     if (err != KERN_SUCCESS)
         return 0;
@@ -207,7 +207,159 @@ long DDCDelay(io_service_t framebuffer) {
     return DDCDelayBase;
 }
 
-bool DDCWrite(io_service_t framebuffer, struct DDCWriteCommand *write) {
+#if __arm64__
+// -------- Apple Silicon DDC/CI transport (IOAVService / DCPAVServiceProxy) --------
+
+// The DDC/CI slave lives at 7-bit I2C address 0x37; the source/offset byte is 0x51.
+#define kDDCChipAddress 0x37
+#define kDDCDataAddress 0x51
+
+// Read a CFProperty from an IORegistry entry, searching recursively into children.
+static CFTypeRef CopyRegistryProperty(io_service_t service, const char *key) {
+    CFStringRef cfKey = CFStringCreateWithCString(kCFAllocatorDefault, key, kCFStringEncodingASCII);
+    CFTypeRef value = IORegistryEntrySearchCFProperty(service, kIOServicePlane, cfKey, kCFAllocatorDefault, kIORegistryIterateRecursively);
+    CFRelease(cfKey);
+    return value;
+}
+
+// Get the IODisplayLocation IOReg path for a CGDisplay (via private CoreDisplay API).
+static CFStringRef CopyDisplayLocation(CGDirectDisplayID displayID) {
+    CFDictionaryRef info = CoreDisplay_DisplayCreateInfoDictionary(displayID);
+    if (!info) return NULL;
+    CFStringRef location = CFDictionaryGetValue(info, CFSTR("IODisplayLocation"));
+    if (location) location = CFStringCreateCopy(NULL, location);
+    CFRelease(info);
+    return location;
+}
+
+CFStringRef ProductNameFromCGDisplayID(CGDirectDisplayID displayID) {
+    CFStringRef location = CopyDisplayLocation(displayID);
+    if (!location) return NULL;
+    io_service_t adapter = IORegistryEntryCopyFromPath(kIOMainPortDefault, location);
+    CFRelease(location);
+    if (adapter == MACH_PORT_NULL) return NULL;
+
+    CFStringRef name = NULL;
+    CFDictionaryRef attrs = CopyRegistryProperty(adapter, "DisplayAttributes");
+    if (attrs) {
+        CFDictionaryRef product = CFDictionaryGetValue(attrs, CFSTR("ProductAttributes"));
+        CFStringRef productName;
+        if (product && CFDictionaryGetValueIfPresent(product, CFSTR("ProductName"), (const void **)&productName))
+            name = CFStringCreateCopy(NULL, productName);
+        CFRelease(attrs);
+    }
+    IOObjectRelease(adapter);
+    return name;
+}
+
+IOAVServiceRef AVServiceFromCGDisplayID(CGDirectDisplayID displayID) {
+    if (CGDisplayIsBuiltin(displayID)) return NULL;
+
+    CFStringRef location = CopyDisplayLocation(displayID);
+    if (!location) return NULL;
+
+    io_iterator_t iter;
+    io_registry_entry_t root = IORegistryGetRootEntry(kIOMainPortDefault);
+    if (IORegistryEntryCreateIterator(root, kIOServicePlane, kIORegistryIterateRecursively, &iter) != KERN_SUCCESS) {
+        CFRelease(location);
+        return NULL;
+    }
+
+    IOAVServiceRef avService = NULL;
+    io_service_t service;
+    bool inTargetSubtree = false;
+    while ((service = IOIteratorNext(iter)) != MACH_PORT_NULL) {
+        if (!inTargetSubtree) {
+            // Look for the display's framebuffer node by matching its IOReg path.
+            io_string_t path;
+            if (IORegistryEntryGetPath(service, kIOServicePlane, path) == KERN_SUCCESS) {
+                CFStringRef pathStr = CFStringCreateWithCString(kCFAllocatorDefault, path, kCFStringEncodingUTF8);
+                if (CFStringCompare(pathStr, location, 0) == kCFCompareEqualTo)
+                    inTargetSubtree = true; // its DCPAVServiceProxy child follows in the recursive walk
+                CFRelease(pathStr);
+            }
+        } else {
+            // Within the matched display's subtree: grab its external DCPAVServiceProxy.
+            io_name_t name;
+            if (IORegistryEntryGetName(service, name) == KERN_SUCCESS && !strcmp(name, "DCPAVServiceProxy")) {
+                IOAVServiceRef candidate = IOAVServiceCreateWithService(kCFAllocatorDefault, service);
+                CFStringRef svcLocation = CopyRegistryProperty(service, "Location");
+                if (candidate && svcLocation && CFStringCompare(svcLocation, CFSTR("External"), 0) == kCFCompareEqualTo) {
+                    if (svcLocation) CFRelease(svcLocation);
+                    IOObjectRelease(service);
+                    avService = candidate;
+                    break;
+                }
+                if (candidate) CFRelease(candidate);
+                if (svcLocation) CFRelease(svcLocation);
+            }
+        }
+        IOObjectRelease(service);
+    }
+    IOObjectRelease(iter);
+    CFRelease(location);
+    return avService;
+}
+
+bool DDCWrite(DDCDisplay display, struct DDCWriteCommand *write) {
+    UInt8 data[6];
+    data[0] = 0x84;
+    data[1] = 0x03;
+    data[2] = write->control_id;
+    data[3] = (write->new_value) >> 8;
+    data[4] = write->new_value & 255;
+    data[5] = 0x6E ^ kDDCDataAddress ^ data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4];
+
+    IOReturn err = kIOReturnSuccess;
+    for (int i = 0; i < 2; i++) { // retry once; DDC writes are fire-and-forget
+        usleep(10000);
+        err = IOAVServiceWriteI2C(display, kDDCChipAddress, kDDCDataAddress, data, sizeof(data));
+        if (err) break;
+    }
+    return err == kIOReturnSuccess;
+}
+
+bool DDCRead(DDCDisplay display, struct DDCReadCommand *read) {
+    UInt8 request[4];
+    request[0] = 0x82;
+    request[1] = 0x01;
+    request[2] = read->control_id;
+    request[3] = 0x6E ^ kDDCDataAddress ^ request[0] ^ request[1] ^ request[2];
+
+    for (int i = 1; i <= kMaxRequests; i++) {
+        UInt8 reply[12] = {};
+
+        IOReturn werr = IOAVServiceWriteI2C(display, kDDCChipAddress, kDDCDataAddress, request, sizeof(request));
+        if (!werr) {
+            usleep(40000); // let the mcu compose its reply (DDC/CI Tmccs)
+            IOReturn rerr = IOAVServiceReadI2C(display, kDDCChipAddress, kDDCDataAddress, reply, sizeof(reply));
+            // reply layout mirrors the wire frame: [1]=len [2]=0x02(VCP reply) [4]=vcp code [7]=max_lo [9]=cur_lo
+            if (!rerr && reply[2] == 0x02 && reply[4] == read->control_id) {
+                if (i > 1)
+                    printf("D: Tries required to get data: %d\n", i);
+                read->success = true;
+                read->max_value = reply[7];
+                read->current_value = reply[9];
+                return true;
+            }
+        }
+
+        if (i >= kMaxRequests) {
+            read->success = false;
+            read->max_value = 0;
+            read->current_value = 0;
+            printf("E: No data after %d tries!\n", i);
+            return false;
+        }
+        usleep(40000); // 40msec -> See DDC/CI Vesa Standard - 4.4.1 Communication Error Recovery
+    }
+    return false;
+}
+
+#else
+// -------- Intel DDC/CI transport (IOFramebuffer I2C) --------
+
+bool DDCWrite(DDCDisplay framebuffer, struct DDCWriteCommand *write) {
     IOI2CRequest    request;
     UInt8           data[128];
 
@@ -235,7 +387,7 @@ bool DDCWrite(io_service_t framebuffer, struct DDCWriteCommand *write) {
     return result;
 }
 
-bool DDCRead(io_service_t framebuffer, struct DDCReadCommand *read) {
+bool DDCRead(DDCDisplay framebuffer, struct DDCReadCommand *read) {
     IOI2CRequest request;
     UInt8 reply_data[11] = {};
     bool result = false;
@@ -300,6 +452,8 @@ bool DDCRead(io_service_t framebuffer, struct DDCReadCommand *read) {
     return result;
 }
 
+#endif // __arm64__
+
 UInt32 SupportedTransactionType() {
    /*
      With my setup (Intel HD4600 via displaylink to 'DELL U2515H') the original app failed to read ddc and freezes my system.
@@ -312,7 +466,7 @@ UInt32 SupportedTransactionType() {
     io_iterator_t   io_objects;
     io_service_t    io_service;
 
-    kr = IOServiceGetMatchingServices(kIOMasterPortDefault,
+    kr = IOServiceGetMatchingServices(kIOMainPortDefault,
                                       IOServiceNameMatching("IOFramebufferI2CInterface"), &io_objects);
 
     if (kr != KERN_SUCCESS) {
