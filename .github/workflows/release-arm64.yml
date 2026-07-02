@@ -1,0 +1,47 @@
+name: Build & Release (Apple Silicon)
+
+# Builds a native Apple Silicon (arm64) ddcctl binary on every push and
+# publishes it as a rolling pre-release under the fixed "latest-arm64" tag.
+on:
+  push:
+    branches:
+      - main
+      - apple-silicon-ddc
+  workflow_dispatch: # allow manual runs from the Actions tab
+
+permissions:
+  contents: write # needed to create/update Releases
+
+jobs:
+  build-and-release:
+    name: Build arm64 & publish rolling release
+    runs-on: macos-14 # macos-14/15 runners are Apple Silicon (arm64)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (release)
+        run: make
+
+      - name: Verify the binary is arm64
+        run: |
+          file bin/release/ddcctl
+          lipo -archs bin/release/ddcctl | grep -q arm64
+
+      - name: Package
+        run: |
+          cd bin/release
+          zip ../../ddcctl_arm64.zip ddcctl
+
+      - name: Publish rolling pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Remove the previous rolling release + tag so the new one points at this commit
+          gh release delete latest-arm64 --yes --cleanup-tag || true
+          gh release create latest-arm64 ./ddcctl_arm64.zip \
+            --title "Latest Apple Silicon build" \
+            --notes "Automated Apple Silicon (arm64) build from commit ${{ github.sha }}." \
+            --prerelease \
+            --target "${{ github.sha }}"
