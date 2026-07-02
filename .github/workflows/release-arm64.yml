@@ -31,17 +31,18 @@ jobs:
 
       - name: Package
         run: |
-          cd bin/release
-          zip ../../ddcctl_arm64.zip ddcctl
+          DATE=$(date -u +%Y%m%d) # UTC build date
+          ASSET="ddcctl_arm64_${DATE}.zip"
+          ( cd bin/release && zip "../../${ASSET}" ddcctl )
+          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
 
-      - name: Publish rolling pre-release
+      - name: Publish rolling release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Remove the previous rolling release + tag so the new one points at this commit
           gh release delete latest-arm64 --yes --cleanup-tag || true
-          gh release create latest-arm64 ./ddcctl_arm64.zip \
+          gh release create latest-arm64 "./${ASSET}" \
             --title "Latest Apple Silicon build" \
             --notes "Automated Apple Silicon (arm64) build from commit ${{ github.sha }}." \
-            --prerelease \
             --target "${{ github.sha }}"
